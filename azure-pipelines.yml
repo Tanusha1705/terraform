@@ -1,0 +1,1000 @@
+#######################################################################################
+# azure-pipelines.yml
+#
+# CI/CD pipeline for Azure VM provisioning via Terraform — 12 stages.
+#
+# Prerequisites:
+#   1. A variable group named "terraform-secrets" in your Azure DevOps Library
+#      containing: ARM_CLIENT_ID, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID,
+#      TF_VAR_admin_password, TF_VAR_domain_join_password,
+#      TF_VAR_domain_join_user, TF_VAR_script_storage_account_key
+#   2. An Azure Service Connection named "azure-prod" with federated credentials
+#      (Workload Identity Federation) — do NOT use a client secret.
+#   3. An environment named "production" in Azure DevOps Environments with a
+#      required approver configured.
+#   4. A self-hosted agent pool named "platform-linux" or change pool to
+#      ubuntu-latest to use Microsoft-hosted agents.
+#
+# Author  : Platform Engineering Team
+# Version : 1.0.0
+#######################################################################################
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+# ---------------------------------------------------------------------------
+# Parameters — override these at queue time for targeted runs
+# ---------------------------------------------------------------------------
+parameters:
+  - name: environment
+    displayName: Target Environment
+    type: string
+    default: prod
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: terraformAction
+    displayName: Terraform Action
+    type: string
+    default: apply
+    values:
+      - plan
+      - apply
+      - destroy
+
+  - name: skipSecurityScan
+    displayName: Skip Security Scan (break-glass only)
+    type: boolean
+    default: false
+
+  - name: forceApply
+    displayName: Force Apply without Approval (non-prod only)
+    type: boolean
+    default: false
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+variables:
+  - group: terraform-secrets            # library variable group
+  - name: TF_VERSION
+    value: "1.7.5"
+  - name: TFSEC_VERSION
+    value: "v1.28.6"
+  - name: CHECKOV_VERSION
+    value: "3.2.0"
+  - name: WORKING_DIR
+    value: $(Build.SourcesDirectory)/terraform
+  - name: TFVARS_PATH
+    value: $(WORKING_DIR)/environments/${{ parameters.environment }}/terraform.tfvars
+  - name: PLAN_FILE
+    value: tfplan-$(Build.BuildId)
+  - name: ARM_USE_OIDC
+    value: "true"
+  - name: TF_IN_AUTOMATION
+    value: "true"
+  - name: TF_CLI_ARGS_plan
+    value: "-input=false"
+  - name: TF_CLI_ARGS_apply
+    value: "-input=false"
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+stages:
+
+  ###########################################################################
+  # Stage 1: Validate Terraform (init + validate)
+  ###########################################################################
+  - stage: Validate
+    displayName: "Stage 1 — Validate Terraform"
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - job: TerraformValidate
+        displayName: terraform init + validate
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform $(TF_VERSION)
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: AzureCLI@2
+            displayName: terraform init
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true   # exposes $servicePrincipalId etc.
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+
+                cd $(WORKING_DIR)
+                terraform init \
+                  -backend=true \
+                  -reconfigure \
+                  -upgrade \
+                  -no-color
+
+          - task: AzureCLI@2
+            displayName: terraform validate
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+
+                cd $(WORKING_DIR)
+                terraform validate -no-color
+
+          # Publish a cache of the .terraform directory to speed up
+          # subsequent stages — avoids re-downloading providers.
+          - task: Cache@2
+            displayName: Cache .terraform directory
+            inputs:
+              key: '"terraform" | "$(Agent.OS)" | $(WORKING_DIR)/.terraform.lock.hcl'
+              restoreKeys: '"terraform" | "$(Agent.OS)"'
+              path: $(WORKING_DIR)/.terraform
+
+  ###########################################################################
+  # Stage 2: Terraform Format Check
+  ###########################################################################
+  - stage: Format
+    displayName: "Stage 2 — Terraform Format"
+    dependsOn: Validate
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - job: TerraformFmt
+        displayName: terraform fmt -check
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform $(TF_VERSION)
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              set -euo pipefail
+              cd $(WORKING_DIR)
+
+              # -recursive checks all subdirectories (modules too)
+              # -diff prints the diff that would be applied
+              terraform fmt -check -recursive -diff -no-color
+            displayName: Check formatting (terraform fmt -check)
+
+          # If fmt fails, give engineers a hint
+          - script: |
+              echo "##vso[task.logissue type=warning]One or more .tf files are not formatted."
+              echo "Run: terraform fmt -recursive $(WORKING_DIR)"
+            condition: failed()
+            displayName: Hint — how to fix fmt errors
+
+  ###########################################################################
+  # Stage 3: Terraform Plan
+  ###########################################################################
+  - stage: Plan
+    displayName: "Stage 3 — Terraform Plan"
+    dependsOn: Format
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - job: TerraformPlan
+        displayName: Generate tfplan artifact
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform $(TF_VERSION)
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: Cache@2
+            displayName: Restore .terraform cache
+            inputs:
+              key: '"terraform" | "$(Agent.OS)" | $(WORKING_DIR)/.terraform.lock.hcl'
+              restoreKeys: '"terraform" | "$(Agent.OS)"'
+              path: $(WORKING_DIR)/.terraform
+
+          - task: AzureCLI@2
+            displayName: terraform plan
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+
+                # Inject all secrets as TF_VAR_ env vars
+                export TF_VAR_admin_password=$(TF_VAR_admin_password)
+                export TF_VAR_domain_join_password=$(TF_VAR_domain_join_password)
+                export TF_VAR_domain_join_user=$(TF_VAR_domain_join_user)
+                export TF_VAR_script_storage_account_key=$(TF_VAR_script_storage_account_key)
+
+                cd $(WORKING_DIR)
+
+                # Run init in case cache missed
+                terraform init -backend=true -no-color 2>/dev/null || true
+
+                terraform plan \
+                  -var-file="$(TFVARS_PATH)" \
+                  -out="$(Build.ArtifactStagingDirectory)/$(PLAN_FILE)" \
+                  -no-color \
+                  2>&1 | tee $(Build.ArtifactStagingDirectory)/plan-output.txt
+
+                # Extract a human-readable summary and print it as a pipeline
+                # notice so it shows up in the build summary tab.
+                CHANGES=$(grep -E "^Plan:" $(Build.ArtifactStagingDirectory)/plan-output.txt || echo "Plan: 0 to add, 0 to change, 0 to destroy.")
+                echo "##vso[task.logissue type=warning]$CHANGES"
+
+          # Convert the binary plan to JSON for downstream tools (checkov, etc.)
+          - task: AzureCLI@2
+            displayName: terraform show (JSON)
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+
+                cd $(WORKING_DIR)
+                terraform show -json "$(Build.ArtifactStagingDirectory)/$(PLAN_FILE)" \
+                  > "$(Build.ArtifactStagingDirectory)/tfplan.json"
+
+          # Publish the plan + JSON as a pipeline artifact so later stages
+          # can download and apply exactly what was reviewed / scanned.
+          - task: PublishPipelineArtifact@1
+            displayName: Publish tfplan artifact
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: tfplan-$(Build.BuildId)
+              publishLocation: pipeline
+
+  ###########################################################################
+  # Stage 4: Security Scan (tfsec + checkov)
+  ###########################################################################
+  - stage: SecurityScan
+    displayName: "Stage 4 — Security Scan"
+    dependsOn: Plan
+    condition: and(succeeded(), eq('${{ parameters.skipSecurityScan }}', false))
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - job: TfSec
+        displayName: tfsec static analysis
+        continueOnError: false   # Hard fail the pipeline on HIGH findings
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download tfplan artifact
+            inputs:
+              artifact: tfplan-$(Build.BuildId)
+              path: $(Build.ArtifactStagingDirectory)
+
+          - script: |
+              set -euo pipefail
+
+              # Install tfsec
+              curl -sSL "https://github.com/aquasecurity/tfsec/releases/download/$(TFSEC_VERSION)/tfsec-linux-amd64" \
+                -o /usr/local/bin/tfsec
+              chmod +x /usr/local/bin/tfsec
+
+              # Run tfsec against the Terraform source.
+              # --format junit produces a JUnit XML for the test results tab.
+              # --minimum-severity HIGH means we only fail on HIGH+ findings.
+              tfsec $(WORKING_DIR) \
+                --format junit \
+                --out $(Build.ArtifactStagingDirectory)/tfsec-results.xml \
+                --minimum-severity HIGH \
+                --no-color \
+                || TFSEC_EXIT=$?
+
+              # Always publish results — even if tfsec found issues — so the
+              # test results tab always shows up.
+              echo "tfsec exit code: ${TFSEC_EXIT:-0}"
+              exit ${TFSEC_EXIT:-0}
+            displayName: Run tfsec
+
+          - task: PublishTestResults@2
+            displayName: Publish tfsec test results
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Build.ArtifactStagingDirectory)/tfsec-results.xml
+              testRunTitle: tfsec — $(Build.BuildId)
+              failTaskOnFailedTests: true
+
+      - job: Checkov
+        displayName: checkov plan scan
+        dependsOn: TfSec
+        continueOnError: false
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download tfplan artifact
+            inputs:
+              artifact: tfplan-$(Build.BuildId)
+              path: $(Build.ArtifactStagingDirectory)
+
+          - script: |
+              set -euo pipefail
+              pip install checkov==$(CHECKOV_VERSION) --quiet
+
+              # Scan the JSON plan — this catches runtime-evaluated values
+              # that source-only scanners like tfsec would miss.
+              checkov \
+                --file $(Build.ArtifactStagingDirectory)/tfplan.json \
+                --framework terraform_plan \
+                --output junitxml \
+                --output-file-path $(Build.ArtifactStagingDirectory)/checkov-results.xml \
+                --soft-fail-on MEDIUM,LOW \
+                --compact \
+                || CHECKOV_EXIT=$?
+
+              echo "checkov exit code: ${CHECKOV_EXIT:-0}"
+              exit ${CHECKOV_EXIT:-0}
+            displayName: Run checkov
+
+          - task: PublishTestResults@2
+            displayName: Publish checkov test results
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: $(Build.ArtifactStagingDirectory)/checkov-results.xml
+              testRunTitle: checkov — $(Build.BuildId)
+              failTaskOnFailedTests: true
+
+  ###########################################################################
+  # Stage 5: Approval Gate
+  # The "production" environment in Azure DevOps must have at least one
+  # required reviewer configured.  This stage blocks until approval is given.
+  ###########################################################################
+  - stage: Approval
+    displayName: "Stage 5 — Manual Approval Gate"
+    dependsOn: SecurityScan
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.environment }}', 'prod'),
+        eq('${{ parameters.forceApply }}', false)
+      )
+    jobs:
+      - deployment: WaitForApproval
+        displayName: Await production approval
+        environment: production   # <-- environment with approval checks configured
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Deployment to production has been approved."
+                    echo "Approver: $(Build.RequestedFor)"
+                    echo "Build:    $(Build.BuildId)"
+                    echo "Branch:   $(Build.SourceBranchName)"
+                  displayName: Log approval details
+
+  ###########################################################################
+  # Stage 6: Terraform Apply
+  ###########################################################################
+  - stage: Apply
+    displayName: "Stage 6 — Terraform Apply"
+    dependsOn:
+      - Approval
+      - SecurityScan   # non-prod skips Approval, falls through from SecurityScan
+    condition: |
+      and(
+        not(failed()),
+        not(canceled()),
+        eq('${{ parameters.terraformAction }}', 'apply')
+      )
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - job: TerraformApply
+        displayName: Apply saved tfplan
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform $(TF_VERSION)
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          # Re-init is required because the apply agent may be different from
+          # the plan agent and the .terraform directory is not shared.
+          - task: AzureCLI@2
+            displayName: terraform init (re-run)
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                cd $(WORKING_DIR)
+                terraform init -backend=true -reconfigure -no-color
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download tfplan artifact
+            inputs:
+              artifact: tfplan-$(Build.BuildId)
+              path: $(Build.ArtifactStagingDirectory)
+
+          - task: AzureCLI@2
+            displayName: terraform apply
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+
+                export TF_VAR_admin_password=$(TF_VAR_admin_password)
+                export TF_VAR_domain_join_password=$(TF_VAR_domain_join_password)
+                export TF_VAR_domain_join_user=$(TF_VAR_domain_join_user)
+                export TF_VAR_script_storage_account_key=$(TF_VAR_script_storage_account_key)
+
+                cd $(WORKING_DIR)
+
+                # Apply the exact plan that was security-scanned and approved.
+                # Using the saved plan file guarantees no drift between plan and apply.
+                terraform apply \
+                  -no-color \
+                  "$(Build.ArtifactStagingDirectory)/$(PLAN_FILE)"
+
+          # Capture the output values from Terraform and write them to a
+          # JSON file for downstream stages to consume.
+          - task: AzureCLI@2
+            displayName: Capture terraform outputs
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+
+                cd $(WORKING_DIR)
+                terraform output -json > "$(Build.ArtifactStagingDirectory)/tf-outputs.json"
+                echo "##vso[task.setvariable variable=VM_NAME;isOutput=true]$(terraform output -raw vm_name)"
+                echo "##vso[task.setvariable variable=VM_ID;isOutput=true]$(terraform output -raw vm_id)"
+            name: TFOutputs
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish terraform outputs
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/tf-outputs.json
+              artifact: tf-outputs-$(Build.BuildId)
+              publishLocation: pipeline
+
+  ###########################################################################
+  # Stage 7: VM Extension Deployment verification
+  # The extensions are deployed by Terraform itself (modules/extensions).
+  # This stage verifies the guest agent reports them as Succeeded.
+  ###########################################################################
+  - stage: VerifyExtensions
+    displayName: "Stage 7 — VM Extension Verification"
+    dependsOn: Apply
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      VM_NAME: $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_NAME'] ]
+    jobs:
+      - job: CheckExtensions
+        displayName: Verify extensions provisioned successfully
+        steps:
+          - task: AzureCLI@2
+            displayName: Check all extensions are Succeeded
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+
+                echo "Checking extensions on VM: $VM in RG: $RG"
+
+                # Retry loop — extensions can take a few minutes to provision.
+                MAX_RETRIES=20
+                SLEEP_SECS=30
+
+                for i in $(seq 1 $MAX_RETRIES); do
+                  STATES=$(az vm extension list \
+                    --resource-group "$RG" \
+                    --vm-name "$VM" \
+                    --query "[].{Name:name, State:provisioningState}" \
+                    --output json)
+
+                  echo "Attempt $i/$MAX_RETRIES — current extension states:"
+                  echo "$STATES" | jq -r '.[] | "\(.Name): \(.State)"'
+
+                  FAILED=$(echo "$STATES" | jq '[.[] | select(.State != "Succeeded")] | length')
+
+                  if [ "$FAILED" -eq "0" ]; then
+                    echo "All extensions are in Succeeded state."
+                    exit 0
+                  fi
+
+                  echo "$FAILED extension(s) not yet Succeeded — waiting ${SLEEP_SECS}s..."
+                  sleep $SLEEP_SECS
+                done
+
+                echo "ERROR: One or more extensions did not reach Succeeded within timeout."
+                az vm extension list --resource-group "$RG" --vm-name "$VM" --output table
+                exit 1
+
+  ###########################################################################
+  # Stage 8: Domain Join verification
+  ###########################################################################
+  - stage: VerifyDomainJoin
+    displayName: "Stage 8 — Domain Join Verification"
+    dependsOn: VerifyExtensions
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      VM_NAME: $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_NAME'] ]
+    jobs:
+      - job: CheckDomainJoin
+        displayName: Confirm VM joined the domain
+        steps:
+          - task: AzureCLI@2
+            displayName: Verify DomainJoin extension status
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+
+                STATE=$(az vm extension show \
+                  --resource-group "$RG" \
+                  --vm-name "$VM" \
+                  --name DomainJoin \
+                  --query "provisioningState" \
+                  --output tsv 2>/dev/null || echo "NotFound")
+
+                if [ "$STATE" = "Succeeded" ]; then
+                  echo "DomainJoin extension provisioned successfully — VM is joined to the domain."
+                  exit 0
+                else
+                  echo "ERROR: DomainJoin extension state is '$STATE'.  Check the VM guest agent logs."
+                  exit 1
+                fi
+
+  ###########################################################################
+  # Stage 9: Software Installation verification
+  ###########################################################################
+  - stage: VerifySoftware
+    displayName: "Stage 9 — Software Installation Verification"
+    dependsOn: VerifyDomainJoin
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      VM_NAME: $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_NAME'] ]
+    jobs:
+      - job: CheckSoftware
+        displayName: Verify Custom Script Extension ran successfully
+        steps:
+          - task: AzureCLI@2
+            displayName: Verify CustomScriptExtension exit code
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+
+                # The Custom Script Extension stores its run status in the
+                # instanceView — look for a non-zero exit code.
+                EXIT_CODE=$(az vm extension show \
+                  --resource-group "$RG" \
+                  --vm-name "$VM" \
+                  --name CustomScriptExtension \
+                  --query "instanceView.statuses[0].code" \
+                  --output tsv 2>/dev/null || echo "unknown")
+
+                echo "CSE status code: $EXIT_CODE"
+
+                # "ProvisioningState/succeeded" means the extension ran
+                # and the script exited 0.
+                if [[ "$EXIT_CODE" == *"succeeded"* ]]; then
+                  echo "Software bootstrap completed successfully."
+                  exit 0
+                else
+                  echo "ERROR: CustomScriptExtension did not report success.  Code: $EXIT_CODE"
+                  exit 1
+                fi
+
+  ###########################################################################
+  # Stage 10: Backup Enablement verification
+  ###########################################################################
+  - stage: VerifyBackup
+    displayName: "Stage 10 — Backup Enablement Verification"
+    dependsOn: VerifySoftware
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      VM_ID: $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_ID'] ]
+    jobs:
+      - job: CheckBackup
+        displayName: Confirm VM is protected in Recovery Services Vault
+        steps:
+          - task: AzureCLI@2
+            displayName: Verify backup protection status
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                VAULT="rsv-platform-prod"
+                VAULT_RG="rg-backup-prod"
+                VM_ID="$(VM_ID)"
+
+                # Extract the VM name from the resource ID
+                VM_NAME=$(basename "$VM_ID")
+
+                echo "Checking backup protection for VM: $VM_NAME"
+
+                # List protected items and check if the VM appears.
+                PROTECTION_STATUS=$(az backup item list \
+                  --resource-group "$VAULT_RG" \
+                  --vault-name "$VAULT" \
+                  --backup-management-type AzureIaasVM \
+                  --workload-type VM \
+                  --query "[?contains(properties.virtualMachineId, '$VM_NAME')].properties.lastBackupStatus" \
+                  --output tsv 2>/dev/null || echo "")
+
+                if [ -z "$PROTECTION_STATUS" ]; then
+                  # Trigger initial backup and wait
+                  echo "VM not yet backed up — triggering initial backup job..."
+
+                  CONTAINER=$(az backup container list \
+                    --resource-group "$VAULT_RG" \
+                    --vault-name "$VAULT" \
+                    --backup-management-type AzureIaasVM \
+                    --query "[?contains(name, '$VM_NAME')].name" \
+                    --output tsv)
+
+                  ITEM=$(az backup item list \
+                    --resource-group "$VAULT_RG" \
+                    --vault-name "$VAULT" \
+                    --backup-management-type AzureIaasVM \
+                    --workload-type VM \
+                    --query "[?contains(properties.virtualMachineId, '$VM_NAME')].name" \
+                    --output tsv)
+
+                  az backup protection backup-now \
+                    --resource-group "$VAULT_RG" \
+                    --vault-name "$VAULT" \
+                    --container-name "$CONTAINER" \
+                    --item-name "$ITEM" \
+                    --retain-until "$(date -d '+30 days' '+%d-%m-%Y')" \
+                    --output none
+
+                  echo "Initial backup job triggered successfully."
+                else
+                  echo "VM is protected.  Last backup status: $PROTECTION_STATUS"
+                fi
+
+  ###########################################################################
+  # Stage 11: Monitoring Enablement verification
+  ###########################################################################
+  - stage: VerifyMonitoring
+    displayName: "Stage 11 — Monitoring Enablement Verification"
+    dependsOn: VerifyBackup
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      VM_NAME: $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_NAME'] ]
+    jobs:
+      - job: CheckMonitoring
+        displayName: Verify AMA and DCR association
+        steps:
+          - task: AzureCLI@2
+            displayName: Verify Azure Monitor Agent extension
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+
+                AMA_STATE=$(az vm extension show \
+                  --resource-group "$RG" \
+                  --vm-name "$VM" \
+                  --name AzureMonitorWindowsAgent \
+                  --query "provisioningState" \
+                  --output tsv 2>/dev/null || echo "NotFound")
+
+                echo "AzureMonitorWindowsAgent state: $AMA_STATE"
+
+                if [ "$AMA_STATE" = "Succeeded" ]; then
+                  echo "Azure Monitor Agent is installed and running."
+                else
+                  echo "ERROR: AMA extension state is '$AMA_STATE'."
+                  exit 1
+                fi
+
+          - task: AzureCLI@2
+            displayName: Verify DCR association exists
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+                SUBSCRIPTION=$(ARM_SUBSCRIPTION_ID)
+
+                VM_ID="/subscriptions/$SUBSCRIPTION/resourceGroups/$RG/providers/Microsoft.Compute/virtualMachines/$VM"
+
+                DCR_COUNT=$(az monitor data-collection rule association list \
+                  --resource "$VM_ID" \
+                  --query "length(@)" \
+                  --output tsv 2>/dev/null || echo "0")
+
+                echo "DCR association count: $DCR_COUNT"
+
+                if [ "$DCR_COUNT" -gt "0" ]; then
+                  echo "Data Collection Rule is associated with the VM."
+                else
+                  echo "ERROR: No DCR association found.  Monitoring data will not flow."
+                  exit 1
+                fi
+
+          - task: AzureCLI@2
+            displayName: Verify diagnostic settings
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+                SUBSCRIPTION=$(ARM_SUBSCRIPTION_ID)
+
+                VM_ID="/subscriptions/$SUBSCRIPTION/resourceGroups/$RG/providers/Microsoft.Compute/virtualMachines/$VM"
+
+                DIAG_COUNT=$(az monitor diagnostic-settings list \
+                  --resource "$VM_ID" \
+                  --query "length(value)" \
+                  --output tsv 2>/dev/null || echo "0")
+
+                echo "Diagnostic settings count: $DIAG_COUNT"
+
+                if [ "$DIAG_COUNT" -gt "0" ]; then
+                  echo "Diagnostic settings configured."
+                else
+                  echo "ERROR: No diagnostic settings found on the VM."
+                  exit 1
+                fi
+
+  ###########################################################################
+  # Stage 12: Compliance Validation
+  ###########################################################################
+  - stage: ComplianceValidation
+    displayName: "Stage 12 — Compliance Validation"
+    dependsOn: VerifyMonitoring
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      VM_NAME: $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_NAME'] ]
+      VM_ID:   $[ stageDependencies.Apply.TerraformApply.outputs['TFOutputs.VM_ID'] ]
+    jobs:
+      - job: ComplianceChecks
+        displayName: Run compliance and connectivity checks
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Check Azure Policy compliance state
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                VM_ID="$(VM_ID)"
+                SUBSCRIPTION=$(ARM_SUBSCRIPTION_ID)
+
+                echo "Checking Azure Policy compliance for VM: $VM_ID"
+
+                # Allow up to 10 minutes for Policy to evaluate the new resource.
+                MAX_RETRIES=10
+                for i in $(seq 1 $MAX_RETRIES); do
+                  NON_COMPLIANT=$(az policy state list \
+                    --resource "$VM_ID" \
+                    --query "[?complianceState=='NonCompliant'].policyDefinitionName" \
+                    --output tsv 2>/dev/null || echo "")
+
+                  if [ -z "$NON_COMPLIANT" ]; then
+                    echo "VM is compliant with all assigned Azure Policies."
+                    exit 0
+                  fi
+
+                  echo "Attempt $i/$MAX_RETRIES — non-compliant policies: $NON_COMPLIANT"
+                  sleep 60
+                done
+
+                echo "##vso[task.logissue type=warning]VM has non-compliant policies:"
+                echo "$NON_COMPLIANT"
+                # We treat policy non-compliance as a warning, not a hard fail,
+                # because some remediations run asynchronously after deployment.
+
+          - task: AzureCLI@2
+            displayName: Verify VM is running
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+
+                POWER_STATE=$(az vm show \
+                  --resource-group "$RG" \
+                  --name "$VM" \
+                  --show-details \
+                  --query "powerState" \
+                  --output tsv)
+
+                echo "VM power state: $POWER_STATE"
+
+                if [ "$POWER_STATE" = "VM running" ]; then
+                  echo "VM is running."
+                else
+                  echo "ERROR: VM is not running.  State: $POWER_STATE"
+                  exit 1
+                fi
+
+          - task: AzureCLI@2
+            displayName: Run Azure Advisor recommendations check
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                VM_ID="$(VM_ID)"
+
+                # Trigger an Advisor recommendation generation for the VM.
+                az advisor recommendation list \
+                  --resource "$VM_ID" \
+                  --output table 2>/dev/null || true
+
+                echo "Advisor check complete."
+
+          - task: AzureCLI@2
+            displayName: Validate tags are present
+            inputs:
+              azureSubscription: azure-prod
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                RG="rg-platform-prod-eastus"
+                VM="$(VM_NAME)"
+
+                REQUIRED_TAGS=("ManagedBy" "Environment" "CostCenter" "Project")
+                TAGS=$(az vm show \
+                  --resource-group "$RG" \
+                  --name "$VM" \
+                  --query "tags" \
+                  --output json)
+
+                echo "VM tags: $TAGS"
+                MISSING=0
+
+                for TAG in "${REQUIRED_TAGS[@]}"; do
+                  if ! echo "$TAGS" | jq -e --arg t "$TAG" 'has($t)' > /dev/null; then
+                    echo "ERROR: Required tag '$TAG' is missing."
+                    MISSING=$((MISSING + 1))
+                  fi
+                done
+
+                if [ "$MISSING" -gt "0" ]; then
+                  echo "$MISSING required tag(s) are missing from the VM."
+                  exit 1
+                fi
+
+                echo "All required tags are present."
+
+          # Final summary — always runs, even if prior steps failed
+          - script: |
+              echo "=============================================="
+              echo "  Deployment Summary — Build $(Build.BuildId)"
+              echo "=============================================="
+              echo "  VM Name    : $(VM_NAME)"
+              echo "  Environment: ${{ parameters.environment }}"
+              echo "  Branch     : $(Build.SourceBranchName)"
+              echo "  Requested  : $(Build.RequestedFor)"
+              echo "  Pipeline   : $(System.TeamProject) / $(Build.DefinitionName)"
+              echo "=============================================="
+            displayName: Print deployment summary
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish compliance report
+            condition: always()
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)
+              artifact: compliance-report-$(Build.BuildId)
+              publishLocation: pipeline

